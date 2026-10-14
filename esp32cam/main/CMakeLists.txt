@@ -1,0 +1,13 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "camera.c"
+        "qr_scanner.c"
+        "uart_protocol.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        driver
+        esp_timer
+        aegis_frame
+)

@@ -1,0 +1,4 @@
+Adafruit GFX Library
+Adafruit SSD1306
+Wire (built-in, ESP32 core)
+WiFi (built-in, ESP32 core)

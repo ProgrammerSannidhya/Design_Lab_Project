@@ -1,0 +1,500 @@
+/* ============================================================================
+ * AegisMed — AI-Powered Smart Healthcare Assistant (EDUCATIONAL PROTOTYPE)
+ * ----------------------------------------------------------------------------
+ * IMPORTANT: This is a college-project / hobbyist DEMONSTRATION device.
+ * It is NOT a certified medical device. All readings are SIMULATED and all
+ * "severity" output is a DEMO SEVERITY calculation, not a clinical diagnosis.
+ * Do not use this project, or any derivative of it, to make real medical
+ * decisions.
+ *
+ * Hardware (as simulated in Wokwi):
+ *   - ESP32 DevKit V1
+ *   - MAX30102 (simulated custom chip) -> Heart Rate + SpO2 over I2C
+ *   - MLX90614 (simulated custom chip) -> Object temperature over I2C
+ *   - SSD1306 128x64 OLED over I2C
+ *   - 2x push buttons (menu / emergency)
+ *   - 1x active buzzer
+ *   - 3x discrete LEDs (R/G/B) each behind a 220 ohm resistor, used as a
+ *     status "RGB" indicator
+ *   - WiFi (Wokwi-GUEST) used for a stubbed sendHealthData() abstraction
+ * ==========================================================================*/
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <WiFi.h>
+
+/* ---------------------------------------------------------------------- */
+/* PIN CONFIGURATION                                                       */
+/* ---------------------------------------------------------------------- */
+static const uint8_t PIN_I2C_SDA   = 21;
+static const uint8_t PIN_I2C_SCL   = 22;
+
+static const uint8_t PIN_BUZZER    = 18;
+static const uint8_t PIN_BUTTON_1  = 17;   // Scan / Menu cycle
+static const uint8_t PIN_BUTTON_2  = 16;   // Emergency / demo alert
+
+static const uint8_t PIN_LED_RED   = 25;
+static const uint8_t PIN_LED_GREEN = 26;
+static const uint8_t PIN_LED_BLUE  = 27;
+
+/* ---------------------------------------------------------------------- */
+/* I2C ADDRESSES / REGISTERS (simulated devices)                          */
+/* ---------------------------------------------------------------------- */
+static const uint8_t OLED_I2C_ADDR      = 0x3C;
+static const uint8_t MAX30102_I2C_ADDR  = 0x57;   // real-world MAX3010x addr
+static const uint8_t MLX90614_I2C_ADDR  = 0x5A;   // real-world MLX90614 addr
+
+// Simplified simulated MAX30102 register map (see max30102.chip.c).
+// NOTE: this is a simplified educational register map, not the real
+// FIFO-based MAX3010x protocol. Porting to real hardware would mean
+// swapping this driver for a library such as SparkFun's MAX3010x lib.
+static const uint8_t MAX_REG_PART_ID  = 0xFF;  // returns 0x15 (real part id)
+static const uint8_t MAX_REG_HEARTRATE = 0x2C; // uint8, BPM
+static const uint8_t MAX_REG_SPO2      = 0x2D; // uint8, percent
+
+// MLX90614 real-world RAM register for "Object Temperature 1"
+static const uint8_t MLX_REG_TOBJ1 = 0x07;     // 16-bit raw, LSB first
+
+/* ---------------------------------------------------------------------- */
+/* TIMING / THRESHOLD CONSTANTS                                           */
+/* ---------------------------------------------------------------------- */
+static const unsigned long SENSOR_READ_INTERVAL_MS   = 1000;
+static const unsigned long DATA_SEND_INTERVAL_MS      = 5000;
+static const unsigned long BUTTON_DEBOUNCE_MS          = 200;
+static const unsigned long EMERGENCY_DISPLAY_MS        = 3000;
+
+static const int HR_NORMAL_LOW      = 60;
+static const int HR_NORMAL_HIGH     = 100;
+static const int HR_CRITICAL_HIGH   = 120;
+
+static const int SPO2_WARNING_LOW   = 90;
+static const int SPO2_NORMAL_LOW    = 95;
+
+static const float TEMP_WARNING_LOW  = 37.5f;
+static const float TEMP_CRITICAL     = 39.0f;
+
+/* ---------------------------------------------------------------------- */
+/* TYPES                                                                   */
+/* ---------------------------------------------------------------------- */
+enum ScreenMode { SCREEN_MAIN = 0, SCREEN_SEVERITY = 1, SCREEN_INFO = 2, SCREEN_COUNT = 3 };
+enum Severity   { SEV_NORMAL = 0, SEV_WARNING = 1, SEV_CRITICAL = 2 };
+
+/* ---------------------------------------------------------------------- */
+/* GLOBAL STATE                                                            */
+/* ---------------------------------------------------------------------- */
+Adafruit_SSD1306 display(128, 64, &Wire, -1);
+
+int   g_heartRate   = 75;
+int   g_spo2        = 98;
+float g_temperature = 36.8f;
+Severity g_severity  = SEV_NORMAL;
+
+ScreenMode g_screenMode = SCREEN_MAIN;
+
+bool g_emergencyActive   = false;
+unsigned long g_emergencyStartedAt = 0;
+
+unsigned long g_lastSensorRead = 0;
+unsigned long g_lastDataSend   = 0;
+
+bool g_btn1LastState = HIGH;
+bool g_btn2LastState = HIGH;
+unsigned long g_btn1LastDebounce = 0;
+unsigned long g_btn2LastDebounce = 0;
+
+/* ---------------------------------------------------------------------- */
+/* FORWARD DECLARATIONS                                                    */
+/* ---------------------------------------------------------------------- */
+void initializeSensors();
+void readSensors();
+void calculateSeverity();
+void updateOLED();
+void handleButtons();
+void updateAlerts();
+void sendHealthData();
+void createEmergencyAlert();
+void showStartupScreen();
+void setRGB(bool r, bool g, bool b);
+const char* severityToString(Severity s);
+
+/* ---------------------------------------------------------------------- */
+/* SETUP                                                                   */
+/* ---------------------------------------------------------------------- */
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println();
+  Serial.println("Mediverse starting...");
+  Serial.println("(Educational prototype - simulated readings only)");
+
+  pinMode(PIN_BUZZER, OUTPUT);
+  digitalWrite(PIN_BUZZER, LOW);
+
+  pinMode(PIN_LED_RED, OUTPUT);
+  pinMode(PIN_LED_GREEN, OUTPUT);
+  pinMode(PIN_LED_BLUE, OUTPUT);
+  setRGB(false, false, false);
+
+  pinMode(PIN_BUTTON_1, INPUT_PULLUP);
+  pinMode(PIN_BUTTON_2, INPUT_PULLUP);
+
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDR)) {
+    Serial.println("ERROR: OLED not found!");
+  } else {
+    Serial.println("OLED initialized");
+  }
+
+  showStartupScreen();
+  initializeSensors();
+
+  // WiFi is only used for the sendHealthData() abstraction / demo purposes.
+  WiFi.mode(WIFI_STA);
+  WiFi.begin("Wokwi-GUEST", "");
+  Serial.println("WiFi initialized");
+
+  delay(1500);
+}
+
+/* ---------------------------------------------------------------------- */
+/* MAIN LOOP                                                               */
+/* ---------------------------------------------------------------------- */
+void loop() {
+  unsigned long now = millis();
+
+  handleButtons();
+
+  if (now - g_lastSensorRead >= SENSOR_READ_INTERVAL_MS) {
+    g_lastSensorRead = now;
+    readSensors();
+    calculateSeverity();
+  }
+
+  if (g_emergencyActive && (now - g_emergencyStartedAt >= EMERGENCY_DISPLAY_MS)) {
+    g_emergencyActive = false;
+  }
+
+  updateOLED();
+  updateAlerts();
+
+  if (now - g_lastDataSend >= DATA_SEND_INTERVAL_MS) {
+    g_lastDataSend = now;
+    sendHealthData();
+  }
+}
+
+/* ---------------------------------------------------------------------- */
+/* SENSOR INITIALIZATION                                                   */
+/* ---------------------------------------------------------------------- */
+void initializeSensors() {
+  Wire.beginTransmission(MAX30102_I2C_ADDR);
+  Wire.write(MAX_REG_PART_ID);
+  Wire.endTransmission(false);
+  Wire.requestFrom((int)MAX30102_I2C_ADDR, 1);
+  uint8_t maxPartId = Wire.available() ? Wire.read() : 0x00;
+
+  if (maxPartId == 0x15) {
+    Serial.println("MAX30102 initialized");
+  } else {
+    Serial.println("WARNING: MAX30102 not responding as expected (sim)");
+  }
+
+  Wire.beginTransmission(MLX90614_I2C_ADDR);
+  Wire.write(MLX_REG_TOBJ1);
+  uint8_t mlxOk = (Wire.endTransmission(false) == 0);
+  Wire.requestFrom((int)MLX90614_I2C_ADDR, 2);
+  if (Wire.available() >= 2) {
+    Wire.read();
+    Wire.read();
+  }
+
+  if (mlxOk) {
+    Serial.println("MLX90614 initialized");
+  } else {
+    Serial.println("WARNING: MLX90614 not responding as expected (sim)");
+  }
+}
+
+/* ---------------------------------------------------------------------- */
+/* SENSOR READING                                                          */
+/* ---------------------------------------------------------------------- */
+void readSensors() {
+  // --- MAX30102 (simulated): heart rate ---
+  Wire.beginTransmission(MAX30102_I2C_ADDR);
+  Wire.write(MAX_REG_HEARTRATE);
+  Wire.endTransmission(false);
+  Wire.requestFrom((int)MAX30102_I2C_ADDR, 1);
+  if (Wire.available()) {
+    g_heartRate = Wire.read();
+  }
+
+  // --- MAX30102 (simulated): SpO2 ---
+  Wire.beginTransmission(MAX30102_I2C_ADDR);
+  Wire.write(MAX_REG_SPO2);
+  Wire.endTransmission(false);
+  Wire.requestFrom((int)MAX30102_I2C_ADDR, 1);
+  if (Wire.available()) {
+    g_spo2 = Wire.read();
+  }
+
+  // --- MLX90614 (simulated): object temperature ---
+  Wire.beginTransmission(MLX90614_I2C_ADDR);
+  Wire.write(MLX_REG_TOBJ1);
+  Wire.endTransmission(false);
+  Wire.requestFrom((int)MLX90614_I2C_ADDR, 2);
+  if (Wire.available() >= 2) {
+    uint8_t lo = Wire.read();
+    uint8_t hi = Wire.read();
+    uint16_t raw = ((uint16_t)hi << 8) | lo;
+    // Real MLX90614 formula: Temp(K) = raw * 0.02 ; Temp(C) = Temp(K) - 273.15
+    g_temperature = (raw * 0.02f) - 273.15f;
+  }
+
+  Serial.print("HR: ");
+  Serial.println(g_heartRate);
+  Serial.print("SpO2: ");
+  Serial.println(g_spo2);
+  Serial.print("Temperature: ");
+  Serial.println(g_temperature, 1);
+}
+
+/* ---------------------------------------------------------------------- */
+/* DEMO SEVERITY CALCULATION                                               */
+/* This is a SIMPLE DEMONSTRATION algorithm only. It is NOT a clinically   */
+/* validated medical scoring system.                                       */
+/* ---------------------------------------------------------------------- */
+void calculateSeverity() {
+  bool critical =
+      (g_spo2 < SPO2_WARNING_LOW) ||
+      (g_temperature >= TEMP_CRITICAL) ||
+      (g_heartRate >= HR_CRITICAL_HIGH) ||
+      (g_heartRate < 40);
+
+  bool warning =
+      (g_spo2 >= SPO2_WARNING_LOW && g_spo2 < SPO2_NORMAL_LOW) ||
+      (g_temperature >= TEMP_WARNING_LOW && g_temperature < TEMP_CRITICAL) ||
+      (g_heartRate > HR_NORMAL_HIGH && g_heartRate < HR_CRITICAL_HIGH) ||
+      (g_heartRate >= 40 && g_heartRate < HR_NORMAL_LOW);
+
+  if (critical) {
+    g_severity = SEV_CRITICAL;
+  } else if (warning) {
+    g_severity = SEV_WARNING;
+  } else {
+    g_severity = SEV_NORMAL;
+  }
+
+  Serial.print("Demo Severity: ");
+  Serial.println(severityToString(g_severity));
+}
+
+const char* severityToString(Severity s) {
+  switch (s) {
+    case SEV_NORMAL:   return "NORMAL";
+    case SEV_WARNING:  return "WARNING";
+    case SEV_CRITICAL: return "CRITICAL";
+  }
+  return "UNKNOWN";
+}
+
+/* ---------------------------------------------------------------------- */
+/* BUTTON HANDLING (polled, debounced)                                     */
+/* ---------------------------------------------------------------------- */
+void handleButtons() {
+  unsigned long now = millis();
+
+  bool btn1Reading = digitalRead(PIN_BUTTON_1);
+  if (btn1Reading != g_btn1LastState && (now - g_btn1LastDebounce) > BUTTON_DEBOUNCE_MS) {
+    g_btn1LastDebounce = now;
+    g_btn1LastState = btn1Reading;
+    if (btn1Reading == LOW) {   // pressed (active low, INPUT_PULLUP)
+      g_screenMode = (ScreenMode)((g_screenMode + 1) % SCREEN_COUNT);
+      Serial.print("Button 1 pressed -> screen mode: ");
+      Serial.println((int)g_screenMode);
+    }
+  }
+
+  bool btn2Reading = digitalRead(PIN_BUTTON_2);
+  if (btn2Reading != g_btn2LastState && (now - g_btn2LastDebounce) > BUTTON_DEBOUNCE_MS) {
+    g_btn2LastDebounce = now;
+    g_btn2LastState = btn2Reading;
+    if (btn2Reading == LOW) {
+      Serial.println("Button 2 pressed -> emergency/demo alert triggered");
+      createEmergencyAlert();
+    }
+  }
+}
+
+void createEmergencyAlert() {
+  g_emergencyActive = true;
+  g_emergencyStartedAt = millis();
+
+  // Short blocking alert pattern - acceptable here since it only runs for a
+  // few hundred ms in direct response to a button press.
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(PIN_BUZZER, HIGH);
+    delay(120);
+    digitalWrite(PIN_BUZZER, LOW);
+    delay(80);
+  }
+}
+
+/* ---------------------------------------------------------------------- */
+/* OLED DISPLAY                                                            */
+/* ---------------------------------------------------------------------- */
+void showStartupScreen() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(20, 8);
+  display.setTextSize(2);
+  display.println("Mediverse");
+  display.setTextSize(1);
+  display.setCursor(10, 30);
+  display.println("Healthcare Assistant");
+  display.drawLine(0, 44, 127, 44, SSD1306_WHITE);
+  display.setCursor(0, 50);
+  display.println("Educational Prototype");
+  display.display();
+}
+
+void updateOLED() {
+  if (g_emergencyActive) {
+    display.clearDisplay();
+    display.setTextSize(2);
+    display.setCursor(4, 4);
+    display.println("!!ALERT!!");
+    display.setTextSize(1);
+    display.setCursor(0, 30);
+    display.println("Check readings");
+    display.setCursor(0, 44);
+    display.println("Consult a doctor");
+    display.display();
+    return;
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  switch (g_screenMode) {
+    case SCREEN_MAIN: {
+      display.setCursor(0, 0);
+      display.println("AegisMed - Readings");
+      display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+
+      display.setCursor(0, 18);
+      display.print("HR:   ");
+      display.print(g_heartRate);
+      display.println(" BPM");
+
+      display.setCursor(0, 32);
+      display.print("SpO2: ");
+      display.print(g_spo2);
+      display.println(" %");
+
+      display.setCursor(0, 46);
+      display.print("Temp: ");
+      display.print(g_temperature, 1);
+      display.println(" C");
+      break;
+    }
+
+    case SCREEN_SEVERITY: {
+      display.setCursor(0, 0);
+      display.println("DEMO SEVERITY");
+      display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+
+      display.setTextSize(2);
+      display.setCursor(10, 26);
+      display.println(severityToString(g_severity));
+
+      display.setTextSize(1);
+      display.setCursor(0, 54);
+      display.println("Not a diagnosis");
+      break;
+    }
+
+    case SCREEN_INFO: {
+      display.setCursor(0, 0);
+      display.println("Device Info");
+      display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+      display.setCursor(0, 16);
+      display.println("Mediverse v1.0 (sim)");
+      display.setCursor(0, 28);
+      display.println("ESP32 DevKit V1");
+      display.setCursor(0, 40);
+      display.print("WiFi: ");
+      display.println(WiFi.status() == WL_CONNECTED ? "Connected" : "Connecting..");
+      display.setCursor(0, 52);
+      display.println("Educational use only");
+      break;
+    }
+
+    default:
+      break;
+  }
+
+  display.display();
+}
+
+/* ---------------------------------------------------------------------- */
+/* ALERTS: RGB LED + BUZZER                                                */
+/* ---------------------------------------------------------------------- */
+void setRGB(bool r, bool g, bool b) {
+  digitalWrite(PIN_LED_RED,   r ? HIGH : LOW);
+  digitalWrite(PIN_LED_GREEN, g ? HIGH : LOW);
+  digitalWrite(PIN_LED_BLUE,  b ? HIGH : LOW);
+}
+
+void updateAlerts() {
+  if (g_emergencyActive) {
+    // Fast red blink while an emergency/demo alert is showing.
+    bool on = (millis() / 150) % 2 == 0;
+    setRGB(on, false, false);
+    return;
+  }
+
+  switch (g_severity) {
+    case SEV_NORMAL:
+      setRGB(false, true, false);          // Green
+      digitalWrite(PIN_BUZZER, LOW);
+      break;
+    case SEV_WARNING:
+      setRGB(false, false, true);          // Blue-ish "caution" indication
+      digitalWrite(PIN_BUZZER, LOW);
+      break;
+    case SEV_CRITICAL: {
+      setRGB(true, false, false);          // Red
+      // Slow periodic buzzer pulse for an ongoing critical state.
+      bool buzzOn = (millis() / 500) % 2 == 0;
+      digitalWrite(PIN_BUZZER, buzzOn ? HIGH : LOW);
+      break;
+    }
+  }
+}
+
+/* ---------------------------------------------------------------------- */
+/* WIFI / BACKEND ABSTRACTION                                              */
+/* This is intentionally a stub: swap the body of this function for a real */
+/* HTTP/MQTT/Firebase/Supabase client later without touching the rest of   */
+/* the firmware.                                                           */
+/* ---------------------------------------------------------------------- */
+void sendHealthData() {
+  Serial.println("---- sendHealthData() ----");
+  Serial.print("WiFi status: ");
+  Serial.println(WiFi.status() == WL_CONNECTED ? "connected" : "not connected");
+  Serial.print("{\"hr\":");
+  Serial.print(g_heartRate);
+  Serial.print(",\"spo2\":");
+  Serial.print(g_spo2);
+  Serial.print(",\"temp\":");
+  Serial.print(g_temperature, 1);
+  Serial.print(",\"demo_severity\":\"");
+  Serial.print(severityToString(g_severity));
+  Serial.println("\"}");
+  Serial.println("---------------------------");
+}

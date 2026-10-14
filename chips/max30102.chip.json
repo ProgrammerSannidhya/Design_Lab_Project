@@ -1,0 +1,24 @@
+{
+  "name": "chip-max30102",
+  "author": "AegisMed Project",
+  "description": "Simulated MAX30102 heart-rate / SpO2 sensor for the AegisMed educational prototype. Exposes a simplified I2C register map (NOT the real FIFO protocol) so demo values can be adjusted live from the control panel.",
+  "pins": ["VIN", "GND", "SDA", "SCL", "INT"],
+  "controls": [
+    {
+      "type": "slider",
+      "id": "hr",
+      "label": "Heart Rate (BPM)",
+      "min": 30,
+      "max": 200,
+      "value": 75
+    },
+    {
+      "type": "slider",
+      "id": "spo2",
+      "label": "SpO2 (%)",
+      "min": 50,
+      "max": 100,
+      "value": 98
+    }
+  ]
+}

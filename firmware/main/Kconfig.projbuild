@@ -1,0 +1,42 @@
+menu "AEGISMED"
+    config AEGIS_DEVICE_ID
+        string "Device ID"
+        default "aegis-001"
+    config AEGIS_DEVICE_KEY
+        string "Device API key (PROTOTYPE default; overridden by NVS key 'dev_key')"
+        default "dev-key-change-me"
+    config AEGIS_WIFI_SSID
+        string "Default Wi-Fi SSID (overridden by NVS key 'wifi_ssid')"
+        default "Wokwi-GUEST"
+    config AEGIS_WIFI_PASS
+        string "Default Wi-Fi password (overridden by NVS key 'wifi_pass')"
+        default ""
+    config AEGIS_BACKEND_URL
+        string "Backend base URL, no trailing slash (NVS key 'backend')"
+        default "http://192.168.1.10:8000"
+    config AEGIS_SENSOR_PERIOD_MS
+        int "Sensor sampling period (ms)"
+        range 500 60000
+        default 2000
+    config AEGIS_QUEUE_CAPACITY
+        int "Offline buffer capacity (records, RAM)"
+        range 10 500
+        default 200
+    choice AEGIS_CAMERA_SOURCE
+        prompt "Medicine scan source"
+        default AEGIS_CAMERA_SOURCE_MOCK
+        config AEGIS_CAMERA_SOURCE_MOCK
+            bool "Simulated ESP32-CAM (Wokwi): injects framed bytes into the real parser"
+        config AEGIS_CAMERA_SOURCE_UART
+            bool "Real ESP32-CAM over UART2"
+    endchoice
+    config AEGIS_UART_RX_GPIO
+        int "UART2 RX GPIO (from CAM TX)"
+        default 16
+    config AEGIS_UART_TX_GPIO
+        int "UART2 TX GPIO (to CAM RX)"
+        default 17
+    config AEGIS_MOCK_SCAN_PERIOD_S
+        int "Mock scan period (s)"
+        default 20
+endmenu

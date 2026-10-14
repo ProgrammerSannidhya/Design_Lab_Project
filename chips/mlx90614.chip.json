@@ -1,0 +1,16 @@
+{
+  "name": "chip-mlx90614",
+  "author": "AegisMed Project",
+  "description": "Simulated MLX90614 non-contact IR temperature sensor for the AegisMed educational prototype. Implements the real object-temperature (TOBJ1) register formula so the same I2C driver logic can transfer to physical hardware.",
+  "pins": ["VIN", "GND", "SDA", "SCL"],
+  "controls": [
+    {
+      "type": "slider",
+      "id": "temp",
+      "label": "Object Temp (C x10)",
+      "min": 300,
+      "max": 420,
+      "value": 368
+    }
+  ]
+}
